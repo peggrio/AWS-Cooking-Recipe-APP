@@ -1,0 +1,74 @@
+name: Deploy App
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build_artifact_and_ami:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+
+      # Build the application artifact (.zip)
+      - name: Build the application artifact
+        run: zip -r ../webapp.zip ./*
+
+      # Build AMI
+      - name: Set up AWS dev credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_DEV }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_DEV }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      #initialize Packer templates
+      - name: Build Packer Template
+        run: |
+          packer fmt -var-file=packer/ami.pkrvars.hcl packer/ami.pkr.hcl
+          packer init -var-file=packer/ami.pkrvars.hcl packer/ami.pkr.hcl
+          packer validate -var-file=packer/ami.pkrvars.hcl packer/ami.pkr.hcl
+          packer build -var-file=packer/ami.pkrvars.hcl packer/ami.pkr.hcl
+
+        env:
+          PACKER_LOG: 1 # enable debug log for packer
+
+      # Deployment
+      - name: Set up AWS demo credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_DEMO }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_DEMO }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy
+        # Get the latest AMI ID
+        # Get the current Launch Template ID used by the Auto Scaling group
+        # Create a new Launch Template version based on the current version and update the AMI ID to the latest AMI ID
+        # Update Auto Scaling group with latest aws_launch_template version
+        # Trigger an instance refresh for an Auto Scaling group
+
+        run: |
+          ami_id=$(aws ec2 describe-images --owners 136109848727 --query 'sort_by(Images, &CreationDate)[-1].ImageId' --output text)
+          lt_id=$(aws autoscaling describe-auto-scaling-groups --query 'AutoScalingGroups[0].LaunchTemplate.LaunchTemplateId' --output text)
+
+          aws ec2 create-launch-template-version \
+          --source-version 1 \
+          --launch-template-id $lt_id \
+          --version-description "Updated AMI to the latest version" \
+          --launch-template-data '{"ImageId":"'$ami_id'","InstanceType":"t2.micro"}'
+
+          my_asg_name=$(aws autoscaling describe-auto-scaling-groups --max-items 1 --query 'AutoScalingGroups[0].AutoScalingGroupName' --output text)
+
+          aws autoscaling update-auto-scaling-group \
+          --auto-scaling-group-name $my_asg_name \
+          --launch-template LaunchTemplateId=$lt_id,Version=$(
+          aws ec2 describe-launch-template-versions \
+          --launch-template-id $lt_id \
+          --query 'reverse(sort_by(LaunchTemplateVersions, &VersionNumber))[0].VersionNumber')
+
+          aws autoscaling start-instance-refresh \
+          --auto-scaling-group-name $my_asg_name \
+          --preferences MinHealthyPercentage=75
